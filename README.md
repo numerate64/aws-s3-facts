@@ -1,43 +1,98 @@
-# AWS S3 Facts
+# AWS S3 Storage Analyzer
 
-This PowerShell project connects to your AWS account and provides information about your S3 buckets, including their names, the number of objects, and the current capacity and object count in each storage tier (storage class).
+A PowerShell script that provides a comprehensive overview of your AWS S3 storage usage, including detailed breakdown by storage class and object counts.
+
+## Features
+- Analyzes all S3 buckets in the specified region
+- Shows storage usage by storage class (STANDARD, GLACIER, GLACIER_IR, etc.)
+- Provides both per-bucket and total storage statistics
+- Displays object counts per storage class
+- Automatically formats storage sizes (KB, MB, GB)
+- Shows progress during execution
+- Exports results to CSV for further analysis
 
 ## Prerequisites
-- PowerShell 7+
+- PowerShell 7 or later
+- AWS account with appropriate S3 permissions
 - Internet connection
 
-## How It Works
-- The script will automatically install the AWS.Tools.S3 module if it is not already installed.
-- You will be prompted for your AWS Access Key ID and Secret Access Key (these are not stored and are hidden during input).
-- The script connects to AWS and summarizes the storage usage for each S3 bucket by storage class.
-- All unique storage classes (e.g., STANDARD, GLACIER, DEEP_ARCHIVE, etc.) found across all buckets will appear as columns in the output table and CSV, even if only one bucket contains that class.
-- For each storage class, both the total storage and the number of objects in that tier are displayed (e.g., `STANDARD`, `STANDARD_ObjectCount`, `GLACIER`, `GLACIER_ObjectCount`).
-- Capacity values are automatically formatted as KB, MB, or GB for readability.
-- Debug output will show the first few objects and all storage classes found in each bucket.
-
 ## Installation
-1. Clone or copy this project folder to your machine.
-2. No manual dependency installation is required; the script handles it.
+1. Clone or download this repository
+2. No additional installation required - the script will automatically install required AWS PowerShell modules
 
 ## Usage
-1. Open PowerShell and navigate to the `aws-s3-facts` directory.
-2. Run the script:
-   ```powershell
-   .\AwsS3BucketReport.ps1
-   ```
-   - Optionally, you can provide parameters:
-     ```powershell
-     .\AwsS3BucketReport.ps1 -AccessKey "YOUR_ACCESS_KEY" -SecretKey "YOUR_SECRET_KEY" -Region "us-east-1"
-     ```
-   - If not provided, you will be securely prompted for your AWS credentials.
+```powershell
+.\AwsS3BucketReport.ps1
+```
+
+### Optional Parameters
+- `-AccessKey`: AWS Access Key ID (will prompt if not provided)
+- `-SecretKey`: AWS Secret Access Key (will prompt if not provided)
+- `-Region`: AWS region (default: us-east-1)
+
+Example with parameters:
+```powershell
+.\AwsS3BucketReport.ps1 -Region us-west-2
+```
 
 ## Output
-- The script will display a table with each bucket's name, the number of objects (`ObjectCount`), the total storage for each storage class, and the number of objects per storage class (e.g., `STANDARD_ObjectCount`). Storage values are shown in the most appropriate unit (KB, MB, or GB).
-- The script will also output the results to a CSV file `s3-bucket-summary.csv` in the current directory. All storage classes found will be included as columns, as well as `ObjectCount` and per-tier object counts.
-- At the end, a summary is printed with the total number of buckets, total number of objects, and total storage (in the most appropriate unit) across all buckets and classes.
-- Debug output will show the first three objects in each bucket and all storage classes detected.
 
----
-**Note:** For large buckets, this script may take some time to run as it enumerates all objects to sum their sizes by storage class.
+### Console Output
+1. Progress bar showing current bucket being processed
+2. Summary table showing all buckets with their storage usage
+3. Grand totals for all buckets
+4. Detailed storage breakdown by class
 
-**Security:** Your AWS credentials are only used for the session and are not stored. Input is hidden for security.
+Example summary:
+```
+Summary:
+- 13 buckets
+- 45,019 objects total
+- 37.71 GB total storage
+
+Storage by Class:
+- STANDARD   :   21.24 GB storage in  44739 objects
+- GLACIER_IR :   10.19 GB storage in    105 objects
+- GLACIER    :    6.28 GB storage in    174 objects
+```
+
+### CSV Output
+Detailed results are saved to `s3-bucket-summary.csv` in the current directory, including:
+- Bucket name
+- Total object count
+- Storage usage per class
+- Object count per class
+
+## Performance Notes
+- The script processes each bucket sequentially
+- Processing time depends on the number of buckets and objects
+- A progress bar shows the current status
+- Large buckets may take several minutes to process
+
+## Security
+- AWS credentials are only used for the current session
+- Credential input is hidden
+- No sensitive data is stored to disk
+- Uses official AWS SDK for PowerShell
+
+## Example Output
+```
+BucketName                                                    ObjectCount GLACIER GLACIER_ObjectCount GLACIER_IR GLACIER_IR_ObjectCount STANDARD STANDARD_ObjectCount
+----------                                                    ----------- ------- ------------------- ---------- --------------------- -------- --------------------
+aq-rubrik-glacier-test                                                  3 0 KB                   0 599.88 MB                   3 0 KB                  0
+aws-cloudtrail-logs-misfirm                                         36702 0 KB                   0 0 KB                       0 133.99 MB          36702
+...
+
+Summary:
+- 13 buckets
+- 45,019 objects total
+- 37.71 GB total storage
+
+Storage by Class:
+- STANDARD   :   21.24 GB storage in  44739 objects
+- GLACIER_IR :   10.19 GB storage in    105 objects
+- GLACIER    :    6.28 GB storage in    174 objects
+```
+
+## License
+This project is open source and available under the MIT License.

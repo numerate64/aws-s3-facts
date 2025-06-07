@@ -29,15 +29,34 @@ $creds = [Amazon.Runtime.BasicAWSCredentials]::new($AccessKey, $SecretKey)
 # Get all S3 buckets using explicit credentials
 $buckets = Get-S3Bucket -Region $Region -Credential $creds
 
+# Initialize storage tracking
 $allStorageClasses = @{}
+$totalStorageByClass = @{}
+$totalObjectsByClass = @{}
+# Process each bucket with progress
+$bucketCount = $buckets.Count
+$current = 0
+
 foreach ($bucket in $buckets) {
+    $current++
     $bucketName = $bucket.BucketName
-    Write-Host "Processing bucket: $bucketName" -ForegroundColor Yellow
-    $objs = Get-S3Object -BucketName $bucketName -Region $Region -Credential $creds
-    Write-Host "  Object count: $($objs.Count)" -ForegroundColor Green
-    $objs | Select-Object -First 3 | ForEach-Object {
-        Write-Host ("    Key: {0}, Size: {1} bytes, StorageClass: {2}" -f $_.Key, $_.Size, $_.StorageClass)
+    
+    # Show progress
+    $progressStatus = "Processing bucket $current of $bucketCount"
+    $progressParams = @{
+        Activity = 'Analyzing S3 Buckets'
+        Status = $progressStatus
+        PercentComplete = ($current / $bucketCount * 100)
+        CurrentOperation = "Bucket: $bucketName"
     }
+    Write-Progress @progressParams
+    
+    $objs = Get-S3Object -BucketName $bucketName -Region $Region -Credential $creds
+    
+    # Update progress with object count
+    $progressParams.CurrentOperation = "Found $($objs.Count) objects"
+    Write-Progress @progressParams
+    
     # Summarize by storage class
     $summary = @{}
     $storageClassesInBucket = @{}
@@ -48,14 +67,18 @@ foreach ($bucket in $buckets) {
         if (-not $storageClassesInBucket.ContainsKey($class)) { $storageClassesInBucket[$class] = 0 }
         $storageClassesInBucket[$class]++
         $allStorageClasses[$class] = $true
-    }
-    # Debug: print all storage classes found in this bucket
-    Write-Host ("  Storage classes found in bucket: {0}" -f ($storageClassesInBucket.Keys -join ", ")) -ForegroundColor Cyan
-    foreach ($class in $storageClassesInBucket.Keys) {
-        if ($class -ne "STANDARD") {
-            Write-Host ("    Example object in {0}: {1}" -f $class, ($objs | Where-Object { ($_.StorageClass -eq $class) } | Select-Object -First 1 -ExpandProperty Key)) -ForegroundColor Magenta
+            
+        # Initialize class tracking if needed
+        if (-not $totalStorageByClass.ContainsKey($class)) {
+            $totalStorageByClass[$class] = 0
+            $totalObjectsByClass[$class] = 0
         }
+        
+        # Update class totals
+        $totalStorageByClass[$class] += $obj.Size
+        $totalObjectsByClass[$class]++
     }
+    # Store storage classes for this bucket
     $bucket.PSObject.Properties.Add((New-Object PSNoteProperty('StorageSummary', $summary)))
 }
 
@@ -94,7 +117,7 @@ $results | Format-Table -AutoSize
 # Output results as CSV
 $csvPath = Join-Path -Path (Get-Location) -ChildPath "s3-bucket-summary.csv"
 $results | Export-Csv -Path $csvPath -NoTypeInformation -Force
-Write-Host "CSV output saved to: $csvPath" -ForegroundColor Cyan
+Write-Host "CSV output saved to: $csvPath"
 
 # Output summary
 $totalBuckets = $results.Count
@@ -111,4 +134,23 @@ foreach ($bucket in $buckets) {
         }
     }
 }
-Write-Host ("Summary: {0} buckets, {1} objects, {2}" -f $totalBuckets, $totalObjects, (Format-Size $totalStorage)) -ForegroundColor Magenta
+# Clear progress
+Write-Progress -Activity "Analysis Complete" -Completed
+
+# Prepare and display summary
+Write-Host "`nSummary:"
+Write-Host ("- {0} buckets" -f $totalBuckets)
+Write-Host ("- {0} objects total" -f $totalObjects)
+Write-Host ("- {0} total storage" -f (Format-Size $totalStorage))
+
+# Add storage by class breakdown
+Write-Host "`nStorage by Class:"
+$totalStorageByClass.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object {
+    $class = $_.Key
+    $storage = $_.Value
+    $objects = $totalObjectsByClass[$class]
+    Write-Host ("- {0,-15}: {1,10} storage in {2,6} objects" -f 
+        $class, 
+        (Format-Size $storage),
+        $objects)
+}

@@ -528,7 +528,6 @@ foreach ($Region in $Regions) {
                         $global:regionStats[$Region].ObjectsByClass[$class] += $count
                     }
                 }
-                }
                 
                 # Update region stats
                 $global:regionStats[$Region].Buckets++

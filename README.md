@@ -1,54 +1,103 @@
 # AWS S3 Storage Analyzer
 
-A PowerShell script that provides a comprehensive overview of your AWS S3 storage usage, including detailed breakdown by storage class and object counts.
+A comprehensive set of tools for analyzing AWS S3 storage usage across your AWS accounts. This repository includes both PowerShell and Python implementations.
+
+## Project Structure
+
+```
+aws-s3-facts/
+├── python/                    # Python implementation
+│   ├── s3_bucket_summary.py    # Main Python script
+│   └── README.md              # Python-specific documentation
+└── README.md                  # This file
+```
 
 ## Features
-- Analyzes all S3 buckets in the specified region
-- Shows storage usage by storage class (STANDARD, GLACIER, GLACIER_IR, etc.)
-- Provides both per-bucket and total storage statistics
-- Displays object counts per storage class
-- Automatically formats storage sizes (KB, MB, GB)
-- Shows progress during execution
-- Exports results to CSV for further analysis
+
+### Common Features (both implementations)
+- Analyze all S3 buckets in your AWS account
+- Show storage usage by storage class (STANDARD, GLACIER, GLACIER_IR, etc.)
+- Provide both per-bucket and total storage statistics
+- Display object counts and total capacity per storage class
+- Export results to CSV for further analysis
+
+### Python Implementation (`/python`)
+- Human-readable size formatting (B, KB, MB, GB, TB, PB)
+- Progress tracking with estimated time remaining
+- Detailed console output and CSV export
+- AWS profile support for multiple account management
+- Timeout handling for large buckets
+- Identifies both largest bucket (by object count) and highest capacity bucket (by size)
 
 ## Prerequisites
-- PowerShell 7 or later
+
+### For Python Version
+- Python 3.6 or later
 - AWS account with appropriate S3 permissions
-- Internet connection
+- Required Python packages: boto3, botocore
 
 ## Installation
+
+### Python Version
 1. Clone or download this repository
-2. No additional installation required - the script will automatically install required AWS PowerShell modules
+2. Install required dependencies:
+   ```bash
+   pip install boto3 botocore
+   ```
+3. Configure AWS credentials using one of these methods:
+   - Run `aws configure`
+   - Set environment variables: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`
+   - Use an AWS credentials file
 
 ## Usage
-```powershell
-.\AwsS3BucketReport.ps1
+
+### Python Version
+Basic usage:
+```bash
+python s3_bucket_summary.py
 ```
 
-### Optional Parameters
-- `-AccessKey`: AWS Access Key ID (will prompt if not provided)
-- `-SecretKey`: AWS Secret Access Key (will prompt if not provided)
-- `-Region`: AWS region (default: us-east-1)
-
-Example with parameters:
-```powershell
-.\AwsS3BucketReport.ps1 -Region us-west-2
-```
+#### Command Line Options
+- `--profile`: Specify AWS profile name (optional)
+  ```bash
+  python s3_bucket_summary.py --profile myprofile
+  ```
 
 ## Output
 
-### Console Output
-1. Progress bar showing current bucket being processed
-2. Summary table showing all buckets with their storage usage
-3. Grand totals for all buckets
-4. Detailed storage breakdown by class
+### Python Version
+Generates two types of output:
+1. **Console Output**: Summary of S3 storage usage
+2. **CSV File**: Detailed report in `s3_bucket_summary.csv`
 
-Example summary:
+Example console output:
 ```
-Summary:
-- 13 buckets
-- 45,019 objects total
-- 37.71 GB total storage
+=== S3 Storage Summary ===
+Total Buckets: 13
+Total Objects: 49,402
+Total Size: 38.0 GB
+
+Storage Class Distribution:
+  GLACIER: 174 objects (983.5 MB)
+  GLACIER_IR: 111 objects (10.5 GB)
+  STANDARD: 49,117 objects (26.6 GB)
+
+Highest Capacity Bucket (by size): example-bucket
+  Size: 20.7 GB
+  Objects: 3,753
+
+Largest Bucket (by object count): logs-bucket
+  Objects: 41,066
+  Size: 156.6 MB
+```
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Commit your changes
+4. Push to the branch
+5. Create a new Pull Request
 
 Storage by Class:
 - STANDARD   :   21.24 GB storage in  44739 objects

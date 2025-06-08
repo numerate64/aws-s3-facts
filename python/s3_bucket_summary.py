@@ -186,6 +186,7 @@ def write_summary_to_csv(summary, account_id=None, filename='s3_bucket_summary.c
         total_size = 0
         storage_class_objects = defaultdict(int)
         storage_class_sizes = defaultdict(int)
+        highest_capacity_bucket = None
         
         # First pass: collect all storage class sizes
         for entry in summary:
@@ -237,22 +238,47 @@ def write_summary_to_csv(summary, account_id=None, filename='s3_bucket_summary.c
             writer.writerow([f'  {sc} Size (Bytes)', size_bytes])
             writer.writerow([f'  {sc} Size (GB)', round(size_gb, 2)])
         
+        # Find highest capacity bucket
+        if summary:
+            highest_capacity_bucket = max(summary, key=lambda x: x['Total Size (Bytes)'])
+        
         # Store for console output
         return {
             'total_buckets': len(summary),
             'total_objects': total_objects,
             'total_size': total_size,
             'storage_class_objects': dict(storage_class_objects),
-            'storage_class_sizes': {k: v for k, v in storage_class_sizes.items()}
+            'storage_class_sizes': {k: v for k, v in storage_class_sizes.items()},
+            'highest_capacity_bucket': highest_capacity_bucket
         }
         
-        # Write bucket with most objects
+        # Write bucket statistics
         if summary:
+            # Find largest bucket by object count
             largest_bucket = max(summary, key=lambda x: x['Object Count'])
+            
+            # Find highest capacity bucket
+            highest_capacity_bucket = max(summary, key=lambda x: x['Total Size (Bytes)'])
+            
+            # Write largest bucket by object count
             writer.writerow([''])
-            writer.writerow(['Largest Bucket by Object Count'])
-            writer.writerow(['Bucket Name', 'Object Count'])
-            writer.writerow([largest_bucket['Bucket Name'], largest_bucket['Object Count']])
+            writer.writerow(['Largest Bucket (by object count)'])
+            writer.writerow(['Bucket Name', largest_bucket['Bucket Name']])
+            writer.writerow(['Object Count', largest_bucket['Object Count']])
+            writer.writerow(['Total Size (Bytes)', largest_bucket['Total Size (Bytes)']])
+            writer.writerow(['Total Size (GB)', round(largest_bucket['Total Size (Bytes)'] / (1024**3), 2)])
+            
+            # Write highest capacity bucket
+            writer.writerow([''])
+            writer.writerow(['Highest Capacity Bucket (by size)'])
+            writer.writerow(['Bucket Name', highest_capacity_bucket['Bucket Name']])
+            writer.writerow(['Total Size (Bytes)', highest_capacity_bucket['Total Size (Bytes)']])
+            writer.writerow(['Total Size (GB)', round(highest_capacity_bucket['Total Size (Bytes)'] / (1024**3), 2)])
+            writer.writerow(['Object Count', highest_capacity_bucket['Object Count']])
+            
+            # Add a note if it's the same bucket
+            if largest_bucket['Bucket Name'] == highest_capacity_bucket['Bucket Name']:
+                writer.writerow(['Note:', 'This is also the bucket with the most objects'])
 
 def format_size(size_bytes):
     """Convert size in bytes to human readable format."""
@@ -322,10 +348,21 @@ def print_console_summary(summary, account_id=None, csv_stats=None):
         size = storage_class_sizes[sc]
         print(f"  {sc}: {count:,} objects ({format_size(size)})")
     
+    if csv_stats and 'highest_capacity_bucket' in csv_stats and csv_stats['highest_capacity_bucket']:
+        hc_bucket = csv_stats['highest_capacity_bucket']
+        print(f"\nHighest Capacity Bucket (by size): {hc_bucket['Bucket Name']}")
+        print(f"  Size: {format_size(hc_bucket['Total Size (Bytes)'])}")
+        print(f"  Objects: {hc_bucket['Object Count']:,}")
+    
     if largest_bucket:
-        print(f"\nLargest Bucket: {largest_bucket['Bucket Name']}")
+        print(f"\nLargest Bucket (by object count): {largest_bucket['Bucket Name']}")
         print(f"  Objects: {largest_bucket['Object Count']:,}")
         print(f"  Size: {format_size(largest_bucket['Total Size (Bytes)'])}")
+        
+        # If the largest bucket by object count is also the highest capacity, show a note
+        if (csv_stats and 'highest_capacity_bucket' in csv_stats and 
+            largest_bucket['Bucket Name'] == csv_stats['highest_capacity_bucket']['Bucket Name']):
+            print("  (This is also the highest capacity bucket)")
     
     print("=" * 25)
 

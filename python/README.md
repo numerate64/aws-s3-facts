@@ -58,23 +58,29 @@ Shows a summary of your S3 storage usage, including:
 - Total number of objects
 - Total storage size (human-readable)
 - Storage class distribution (object counts and sizes)
-- Largest bucket information
+- Highest capacity bucket (by size)
+- Largest bucket (by object count)
 
 Example output:
 ```
 === S3 Storage Summary ===
 Total Buckets: 13
-Total Objects: 46,059
-Total Size: 37.7 GB
+Total Objects: 49,402
+Total Size: 38.0 GB
 
 Storage Class Distribution:
-  GLACIER: 174 objects (986.4 MB)
-  GLACIER_IR: 105 objects (10.2 GB)
-  STANDARD: 45,780 objects (26.6 GB)
+  GLACIER: 174 objects (983.5 MB)
+  GLACIER_IR: 111 objects (10.5 GB)
+  STANDARD: 49,117 objects (26.6 GB)
 
-Largest Bucket: aws-cloudtrail-logs-misfirm
-  Objects: 37,742
-  Size: 137.7 MB
+Highest Capacity Bucket (by size): misfirm-aq-vhb
+  Size: 20.7 GB
+  Objects: 3,753
+
+Largest Bucket (by object count): aws-cloudtrail-logs-misfirm
+  Objects: 41,066
+  Size: 156.6 MB
+  (This is also the highest capacity bucket)  [Note appears when applicable]
 ```
 
 ### 2. CSV Output (s3_bucket_summary.csv)
@@ -83,6 +89,9 @@ Contains detailed information in CSV format, including:
 - Per-bucket details (name, object count, size, storage classes)
 - Summary statistics
 - Detailed storage class distribution with object counts and sizes
+- Largest bucket by object count (with size and object count)
+- Highest capacity bucket by size (with size and object count)
+- Note if both are the same bucket
 
 ## Timeout Handling
 

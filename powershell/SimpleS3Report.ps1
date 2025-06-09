@@ -299,29 +299,55 @@ $storageClassSummary | Format-Table -Property StorageClass, ObjectCount, @{Name=
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $csvPath = "s3-bucket-report-$timestamp.csv"
 
-# Flatten the storage class data for CSV export
+# Prepare CSV data with all storage classes as columns
+# First, get all possible storage classes across all buckets
+$allStorageClassNames = $report.StorageClasses | ForEach-Object { $_.StorageClass } | Sort-Object -Unique
+
+# Create CSV data with consistent columns
 $csvData = foreach ($item in $report) {
-    $baseProps = @{
-        BucketName = $item.BucketName
-        Region = $item.Region
-        ObjectCount = $item.ObjectCount
-        TotalSize = $item.TotalSize
-        CreationDate = $item.CreationDate
+    # Format creation date
+    $creationDate = if ($item.CreationDate) { 
+        (Get-Date $item.CreationDate).ToString('yyyy-MM-dd HH:mm:ss "UTC"zzz') 
+    } else { 
+        'N/A' 
     }
     
-    # Add storage class columns
-    $storageClassProps = @{}
+    # Create base properties
+    $csvItem = [PSCustomObject]@{
+        'Bucket Name'    = $item.BucketName
+        'Region'         = $item.Region
+        'Total Objects'  = $item.ObjectCount
+        'Total Size'     = $item.TotalSize
+        'Creation Date'  = $creationDate
+    }
+    
+    # Initialize all storage class columns with zeros
+    foreach ($sc in $allStorageClassNames) {
+        $csvItem | Add-Member -MemberType NoteProperty -Name "$sc Objects" -Value 0
+        $csvItem | Add-Member -MemberType NoteProperty -Name "$sc Size" -Value '0 B'
+    }
+    
+    # Fill in actual values for this bucket's storage classes
     foreach ($sc in $item.StorageClasses) {
-        $storageClassProps["$($sc.StorageClass)_Objects"] = $sc.ObjectCount
-        $storageClassProps["$($sc.StorageClass)_Size"] = $sc.TotalSize
+        $scName = $sc.StorageClass
+        $csvItem."$scName Objects" = $sc.ObjectCount
+        $csvItem."$scName Size" = $sc.FormattedSize
     }
     
-    # Combine all properties
-    $combinedProps = $baseProps + $storageClassProps
-    [PSCustomObject]$combinedProps
+    $csvItem
 }
 
-# Export to CSV
-$csvData | Export-Csv -Path $csvPath -NoTypeInformation
+# Reorder columns for better readability
+$columnOrder = @('Bucket Name', 'Region', 'Creation Date', 'Total Objects', 'Total Size')
+$storageClassColumns = $allStorageClassNames | ForEach-Object { 
+    $sc = $_
+    @("$sc Objects", "$sc Size")
+} | Select-Object -Unique
+
+$columnOrder += $storageClassColumns
+
+# Export to CSV with ordered columns
+$csvData | Select-Object $columnOrder | 
+    Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
 
 Write-Host "`nReport saved to: $csvPath"

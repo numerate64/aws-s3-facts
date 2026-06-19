@@ -1,353 +1,298 @@
-# Simple S3 Bucket Report using AWS CLI
-# This script provides a summary of S3 buckets and their contents
+<#
+.SYNOPSIS
+Counts S3 objects and sums exact capacity by S3 storage class.
 
+.DESCRIPTION
+Uses one automatically paginated AWS CLI process per bucket and scans buckets
+in parallel on PowerShell 7. PowerShell 5.1 is supported with sequential scans.
+Object metadata is aggregated as it arrives and is never retained in memory.
+#>
+
+[CmdletBinding()]
 param(
-    [switch]$SkipLargeBuckets = $false,
-    [string]$ProfileName = "default",
-    [string]$Region = "us-east-1"
+    [string]$ProfileName,
+    [ValidateRange(1, 64)]
+    [int]$Workers = 8,
+    [string]$OutputPath = "s3-bucket-report-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv",
+    [switch]$RequesterPays
 )
 
-# Set error action preference
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
 
-# Function to format size in human-readable format
 function Format-Size {
-    param([long]$size)
-    
-    $suffix = 'B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB'
-    $index = 0
-    
-    while ($size -gt 1KB -and $index -lt ($suffix.Length - 1)) {
-        $size = $size / 1KB
-        $index++
-    }
-    
-    return "{0:N2} {1}" -f $size, $suffix[$index]
-}
+    param([long]$Bytes)
 
-# Function to get bucket region
-function Get-BucketRegion {
-    param([string]$bucketName)
-    
-    try {
-        $location = aws s3api get-bucket-location --bucket $bucketName --query "LocationConstraint" --output text 2>$null
-        if ([string]::IsNullOrEmpty($location) -or $location -eq 'None') {
-            return 'us-east-1'
+    $value = [double]$Bytes
+    foreach ($unit in @('B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB')) {
+        if ($value -lt 1024 -or $unit -eq 'PiB') {
+            if ($unit -eq 'B') { return '{0:N0} {1}' -f $value, $unit }
+            return '{0:N2} {1}' -f $value, $unit
         }
-        return $location
-    } catch {
-        Write-Warning "Failed to get region for bucket ${bucketName}: $_"
-        return $null
+        $value /= 1024
     }
 }
 
-# Function to get bucket objects
-function Get-BucketObjects {
+function Get-AwsBaseArguments {
+    param([string]$Profile)
+
+    $arguments = [System.Collections.Generic.List[string]]::new()
+    if (-not [string]::IsNullOrWhiteSpace($Profile)) {
+        $arguments.Add('--profile')
+        $arguments.Add($Profile)
+    }
+    $arguments.Add('--no-cli-pager')
+    return $arguments.ToArray()
+}
+
+$awsCommand = Get-Command aws -ErrorAction SilentlyContinue
+if (-not $awsCommand) {
+    throw 'AWS CLI v2 was not found in PATH.'
+}
+
+$awsExecutable = $awsCommand.Source
+$baseArguments = Get-AwsBaseArguments -Profile $ProfileName
+$useRequesterPays = [bool]$RequesterPays
+
+try {
+    $identityJson = & $awsExecutable @baseArguments sts get-caller-identity --output json
+    if ($LASTEXITCODE -ne 0) { throw 'AWS authentication failed.' }
+    $identity = $identityJson | ConvertFrom-Json
+
+    $bucketJson = & $awsExecutable @baseArguments s3api list-buckets `
+        --query 'Buckets[].{Name:Name,CreationDate:CreationDate}' --output json
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to list S3 buckets.' }
+    $buckets = @($bucketJson | ConvertFrom-Json)
+}
+catch {
+    throw "Unable to initialize AWS access: $($_.Exception.Message)"
+}
+
+$scanBucket = {
     param(
-        [string]$bucketName,
-        [string]$region,
-        [switch]$skipLarge = $false
+        $Bucket,
+        [string]$AwsExecutable,
+        [string[]]$BaseArguments,
+        [bool]$UseRequesterPays
     )
-    
-    $objects = @()
-    $continuationToken = $null
-    $totalSize = 0
-    $objectCount = 0
-    $maxObjects = 1000
-    
-    # Initialize storage class tracking
-    $storageClasses = @{
-        'STANDARD' = @{Count=0; Size=0}
-        'STANDARD_IA' = @{Count=0; Size=0}
-        'INTELLIGENT_TIERING' = @{Count=0; Size=0}
-        'ONEZONE_IA' = @{Count=0; Size=0}
-        'GLACIER' = @{Count=0; Size=0}
-        'DEEP_ARCHIVE' = @{Count=0; Size=0}
-        'GLACIER_IR' = @{Count=0; Size=0}
-        'OUTPOSTS' = @{Count=0; Size=0}
-        'SNOW' = @{Count=0; Size=0}
-        'EXPRESS_ONEZONE' = @{Count=0; Size=0}
-        'UNKNOWN' = @{Count=0; Size=0}
-    }
-    
+
+    $started = [System.Diagnostics.Stopwatch]::StartNew()
+    $bucketName = [string]$Bucket.Name
+    $region = ''
+    $objectCount = [long]0
+    $totalBytes = [long]0
+    $tiers = @{}
+    $errorMessage = ''
+
     try {
-        do {
-            # Find AWS CLI executable
-            $awsExe = (Get-Command aws -ErrorAction SilentlyContinue).Source
-            if (-not $awsExe) {
-                $awsExe = "$env:ProgramFiles\Amazon\AWSCLIV2\aws.exe"
-                if (-not (Test-Path $awsExe)) {
-                    $awsExe = "$env:ProgramFiles\Amazon\AWSCLIV2\bin\aws.cmd"
+        $location = & $AwsExecutable @BaseArguments s3api get-bucket-location `
+            --bucket $bucketName --query LocationConstraint --output text 2>&1
+        if ($LASTEXITCODE -ne 0) { throw ($location -join [Environment]::NewLine) }
+
+        $region = ([string]$location).Trim()
+        if ([string]::IsNullOrWhiteSpace($region) -or $region -eq 'None') {
+            $region = 'us-east-1'
+        }
+        elseif ($region -eq 'EU') {
+            $region = 'eu-west-1'
+        }
+
+        $listArguments = [System.Collections.Generic.List[string]]::new()
+        foreach ($argument in $BaseArguments) { $listArguments.Add($argument) }
+        $listArguments.Add('s3api')
+        $listArguments.Add('list-objects-v2')
+        $listArguments.Add('--bucket')
+        $listArguments.Add($bucketName)
+        $listArguments.Add('--region')
+        $listArguments.Add($region)
+        $listArguments.Add('--page-size')
+        $listArguments.Add('1000')
+        $listArguments.Add('--query')
+        $listArguments.Add('Contents[].[Size,StorageClass]')
+        $listArguments.Add('--output')
+        $listArguments.Add('text')
+        if ($UseRequesterPays) {
+            $listArguments.Add('--request-payer')
+            $listArguments.Add('requester')
+        }
+
+        $listArgumentArray = $listArguments.ToArray()
+        & $AwsExecutable @listArgumentArray 2>&1 | ForEach-Object {
+            $line = [string]$_
+            $fields = $line -split "`t", 2
+            $size = [long]0
+            if ($fields.Count -eq 2 -and [long]::TryParse($fields[0], [ref]$size)) {
+                $storageClass = $fields[1].Trim().ToUpperInvariant()
+                if ([string]::IsNullOrWhiteSpace($storageClass) -or $storageClass -eq 'NONE') {
+                    $storageClass = 'STANDARD'
                 }
-            }
-            
-            if (-not (Test-Path $awsExe)) {
-                throw "AWS CLI not found. Please install AWS CLI v2 and ensure it's in your PATH."
-            }
-            
-            # Build the AWS CLI command to include storage class
-            $awsArgs = @(
-                "s3api", "list-objects-v2",
-                "--bucket", "$bucketName",
-                "--region", "$region",
-                "--output", "json"
-            )
-            
-            # Add pagination token if available
-            if ($continuationToken) {
-                $awsArgs += "--starting-token"
-                $awsArgs += $continuationToken
-            }
-            
-            # Execute the command and handle the output
-            $result = & $awsExe $awsArgs 2>$null | ConvertFrom-Json
-            
-            # Check if we got any objects
-            if ($result.Contents) {
-                $batchCount = $result.Contents.Count
-                $batchSize = ($result.Contents | Measure-Object -Property Size -Sum).Sum
-                
-                $objects += $result.Contents
-                $totalSize += $batchSize
-                $objectCount += $batchCount
-                
-                # Track storage classes
-                foreach ($obj in $result.Contents) {
-                    $storageClass = if ($obj.StorageClass) { $obj.StorageClass } else { 'STANDARD' }
-                    if (-not $storageClasses.ContainsKey($storageClass)) {
-                        $storageClass = 'UNKNOWN'
+
+                if (-not $tiers.ContainsKey($storageClass)) {
+                    $tiers[$storageClass] = @{
+                        ObjectCount = [long]0
+                        SizeBytes = [long]0
                     }
-                    $storageClasses[$storageClass].Count++
-                    $storageClasses[$storageClass].Size += $obj.Size
                 }
-                
-                Write-Host "  Found $batchCount objects in batch (Total: $objectCount objects, $(Format-Size $totalSize))"
-                
-                # Check if we should stop early
-                if ($skipLarge -and $objectCount -ge $maxObjects) {
-                    Write-Host "  Reached $maxObjects objects, skipping remaining..." -ForegroundColor Yellow
-                    break
-                }
+
+                $objectCount++
+                $totalBytes += $size
+                $tiers[$storageClass].ObjectCount++
+                $tiers[$storageClass].SizeBytes += $size
             }
-            
-            # Check if there are more objects to fetch
-            if ($result.IsTruncated -and $result.NextToken) {
-                $continuationToken = $result.NextToken
-            } else {
-                $continuationToken = $null
-            }
-            
-        } while ($continuationToken)
-        
-    } catch {
-        Write-Warning "  Error listing objects in $bucketName : $_"
-    }
-    
-    # Convert storage classes to a cleaner format
-    $storageClassInfo = $storageClasses.GetEnumerator() | Where-Object { $_.Value.Count -gt 0 } | ForEach-Object {
-        [PSCustomObject]@{
-            StorageClass = $_.Key
-            ObjectCount = $_.Value.Count
-            TotalSize = $_.Value.Size
-            FormattedSize = Format-Size $_.Value.Size
+        }
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "AWS CLI list-objects-v2 exited with code $LASTEXITCODE."
         }
     }
-    
-    return @{
-        Objects = $objects
-        TotalSize = $totalSize
+    catch {
+        $errorMessage = $_.Exception.Message
+    }
+    finally {
+        $started.Stop()
+    }
+
+    [PSCustomObject]@{
+        BucketName = $bucketName
+        Region = $region
+        CreationDate = $Bucket.CreationDate
         ObjectCount = $objectCount
-        StorageClasses = $storageClassInfo
+        SizeBytes = $totalBytes
+        Tiers = $tiers
+        Error = $errorMessage
+        ElapsedSeconds = $started.Elapsed.TotalSeconds
+    }
+}
+$scanBucketText = $scanBucket.ToString()
+
+Write-Host "AWS account: $($identity.Account)"
+Write-Host "Found $($buckets.Count) buckets; scanning with $Workers worker(s)..."
+$overallTimer = [System.Diagnostics.Stopwatch]::StartNew()
+
+if ($PSVersionTable.PSVersion.Major -ge 7 -and $Workers -gt 1) {
+    $results = @(
+        $buckets | ForEach-Object -Parallel {
+            $worker = [scriptblock]::Create($using:scanBucketText)
+            & $worker $_ $using:awsExecutable $using:baseArguments $using:useRequesterPays
+        } -ThrottleLimit $Workers
+    )
+}
+else {
+    if ($Workers -gt 1) {
+        Write-Warning 'PowerShell 7+ is required for parallel scans; running sequentially.'
+    }
+    $results = @(
+        foreach ($bucket in $buckets) {
+            & $scanBucket $bucket $awsExecutable $baseArguments $useRequesterPays
+        }
+    )
+}
+
+$overallTimer.Stop()
+$results = @($results | Sort-Object BucketName)
+
+foreach ($result in $results) {
+    if ($result.Error) {
+        Write-Warning "$($result.BucketName): $($result.Error)"
+    }
+    else {
+        Write-Host (
+            '{0}: {1:N0} objects, {2} in {3:N1}s' -f `
+                $result.BucketName,
+                $result.ObjectCount,
+                (Format-Size $result.SizeBytes),
+                $result.ElapsedSeconds
+        )
     }
 }
 
-# Main script
-Write-Host "=== S3 Bucket Report ==="
-Write-Host "Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-Write-Host ""
+$tierNames = @(
+    $results |
+        ForEach-Object { $_.Tiers.Keys } |
+        Sort-Object -Unique
+)
 
-# Set AWS profile if specified
-if ($ProfileName -ne "default") {
-    $env:AWS_PROFILE = $ProfileName
+$csvData = foreach ($result in $results) {
+    $row = [ordered]@{
+        'Bucket Name' = $result.BucketName
+        'Region' = $result.Region
+        'Creation Date' = $result.CreationDate
+        'Object Count' = $result.ObjectCount
+        'Total Size (Bytes)' = $result.SizeBytes
+        'Total Size' = (Format-Size $result.SizeBytes)
+        'Elapsed Seconds' = $result.ElapsedSeconds
+        'Error' = $result.Error
+    }
+
+    foreach ($tierName in $tierNames) {
+        $usage = $result.Tiers[$tierName]
+        $count = if ($usage) { [long]$usage.ObjectCount } else { [long]0 }
+        $bytes = if ($usage) { [long]$usage.SizeBytes } else { [long]0 }
+        $row["$tierName Objects"] = $count
+        $row["$tierName Size (Bytes)"] = $bytes
+        $row["$tierName Size"] = (Format-Size $bytes)
+    }
+
+    [PSCustomObject]$row
 }
 
-# Set AWS region
-$env:AWS_DEFAULT_REGION = $Region
+$successfulResults = @($results | Where-Object { -not $_.Error })
+$totalObjects = [long](($successfulResults | Measure-Object ObjectCount -Sum).Sum)
+$totalBytes = [long](($successfulResults | Measure-Object SizeBytes -Sum).Sum)
+$tierTotals = @{}
 
-# Test AWS credentials
-try {
-    $caller = aws sts get-caller-identity --output json 2>&1 | ConvertFrom-Json
-    if (-not $caller.Arn) { throw "Failed to get caller identity" }
-    Write-Host "Authenticated as: $($caller.Arn)"
-} catch {
-    Write-Error "Failed to authenticate with AWS. Please check your credentials."
-    Write-Error "Error: $_"
-    Write-Host ""
-    Write-Host "To configure AWS credentials, you can run:"
-    Write-Host "1. aws configure"
-    Write-Host "   or"
-    Write-Host "2. Set environment variables: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and optionally AWS_DEFAULT_REGION"
+foreach ($result in $successfulResults) {
+    foreach ($tierName in $result.Tiers.Keys) {
+        if (-not $tierTotals.ContainsKey($tierName)) {
+            $tierTotals[$tierName] = @{ ObjectCount = [long]0; SizeBytes = [long]0 }
+        }
+        $tierTotals[$tierName].ObjectCount += [long]$result.Tiers[$tierName].ObjectCount
+        $tierTotals[$tierName].SizeBytes += [long]$result.Tiers[$tierName].SizeBytes
+    }
+}
+
+$totalRow = [ordered]@{
+    'Bucket Name' = '__ACCOUNT_TOTAL__'
+    'Region' = ''
+    'Creation Date' = ''
+    'Object Count' = $totalObjects
+    'Total Size (Bytes)' = $totalBytes
+    'Total Size' = (Format-Size $totalBytes)
+    'Elapsed Seconds' = ''
+    'Error' = ''
+}
+foreach ($tierName in $tierNames) {
+    $usage = $tierTotals[$tierName]
+    $count = if ($usage) { [long]$usage.ObjectCount } else { [long]0 }
+    $bytes = if ($usage) { [long]$usage.SizeBytes } else { [long]0 }
+    $totalRow["$tierName Objects"] = $count
+    $totalRow["$tierName Size (Bytes)"] = $bytes
+    $totalRow["$tierName Size"] = (Format-Size $bytes)
+}
+
+$csvData = @($csvData) + [PSCustomObject]$totalRow
+$csvData | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+
+Write-Host "`n=== S3 Storage Summary ==="
+Write-Host "Buckets scanned: $($successfulResults.Count)/$($results.Count)"
+Write-Host ('Total objects:   {0:N0}' -f $totalObjects)
+Write-Host "Total capacity:  $(Format-Size $totalBytes) ($('{0:N0}' -f $totalBytes) bytes)"
+Write-Host "`nStorage class / tier:"
+
+$tierTotals.GetEnumerator() |
+    Sort-Object Name |
+    ForEach-Object {
+        Write-Host (
+            '  {0,-24} {1,15:N0} objects  {2,14}  ({3:N0} bytes)' -f `
+                $_.Name,
+                $_.Value.ObjectCount,
+                (Format-Size $_.Value.SizeBytes),
+                $_.Value.SizeBytes
+        )
+    }
+
+Write-Host "`nCSV written to $OutputPath"
+Write-Host ('Completed in {0:N1}s' -f $overallTimer.Elapsed.TotalSeconds)
+
+if (@($results | Where-Object { $_.Error }).Count -gt 0) {
     exit 1
 }
-
-# Get all buckets
-Write-Host "`nFetching S3 buckets..."
-try {
-    $buckets = aws s3api list-buckets --query "Buckets[*].{Name:Name,CreationDate:CreationDate}" --output json 2>&1 | ConvertFrom-Json
-    if (-not $buckets) { throw "No buckets found or access denied" }
-} catch {
-    Write-Error "Failed to list S3 buckets: $_"
-    exit 1
-}
-
-Write-Host "Found $($buckets.Count) buckets"
-
-# Process each bucket
-$report = @()
-$totalObjects = 0
-$totalSize = 0
-
-foreach ($bucket in $buckets) {
-    $bucketName = $bucket.Name
-    
-    # Process all buckets including CloudTrail
-    Write-Host "`n[$(Get-Date -Format 'HH:mm:ss')] Processing bucket: $bucketName"
-    
-    Write-Host "`n[$(Get-Date -Format 'HH:mm:ss')] Processing bucket: $bucketName"
-    
-    try {
-        # Get bucket region
-        $bucketRegion = Get-BucketRegion -bucketName $bucketName
-        if (-not $bucketRegion) {
-            Write-Warning "  Could not determine bucket region, skipping..."
-            continue
-        }
-        
-        # Get bucket objects
-        Write-Host "  Getting objects from $bucketRegion..."
-        $objects = Get-BucketObjects -bucketName $bucketName -region $bucketRegion -skipLarge:$SkipLargeBuckets
-        
-        # Add to totals
-        $totalObjects += $objects.ObjectCount
-        $totalSize += $objects.TotalSize
-        
-        # Add to report
-        $report += [PSCustomObject]@{
-            BucketName = $bucketName
-            Region = $bucketRegion
-            ObjectCount = $objects.ObjectCount
-            TotalSize = Format-Size $objects.TotalSize
-            RawSize = $objects.TotalSize
-            CreationDate = $bucket.CreationDate
-            StorageClasses = $objects.StorageClasses
-        }  
-        Write-Host "  - Objects: $($objects.ObjectCount)"
-        Write-Host "  - Total Size: $(Format-Size $objects.TotalSize)"
-        
-    } catch {
-        Write-Warning "  Error processing bucket $bucketName : $_"
-    }
-}
-
-# Generate report
-Write-Host "`n=== Report Summary ==="
-Write-Host "Total Buckets Processed: $($report.Count)"
-Write-Host "Total Objects: $totalObjects"
-Write-Host "Total Storage: $(Format-Size $totalSize)"
-
-# Group by region
-$byRegion = $report | Group-Object Region | Sort-Object Name | ForEach-Object {
-    $size = ($_.Group | Measure-Object -Property RawSize -Sum).Sum
-    [PSCustomObject]@{
-        Region = $_.Name
-        BucketCount = $_.Count
-        ObjectCount = ($_.Group | Measure-Object -Property ObjectCount -Sum).Sum
-        TotalSize = Format-Size $size
-    }
-}
-
-# Calculate storage class summary across all buckets
-$allStorageClasses = @{}
-foreach ($bucket in $report) {
-    foreach ($sc in $bucket.StorageClasses) {
-        if (-not $allStorageClasses.ContainsKey($sc.StorageClass)) {
-            $allStorageClasses[$sc.StorageClass] = @{Count=0; Size=0}
-        }
-        $allStorageClasses[$sc.StorageClass].Count += $sc.ObjectCount
-        $allStorageClasses[$sc.StorageClass].Size += $sc.TotalSize
-    }
-}
-
-# Convert to sorted array
-$storageClassSummary = $allStorageClasses.GetEnumerator() | ForEach-Object {
-    [PSCustomObject]@{
-        StorageClass = $_.Key
-        ObjectCount = $_.Value.Count
-        TotalSize = Format-Size $_.Value.Size
-        RawSize = $_.Value.Size
-    }
-} | Sort-Object -Property RawSize -Descending
-
-Write-Host "`n=== By Region ==="
-$byRegion | Format-Table -AutoSize
-
-# Show storage class summary
-Write-Host "`n=== Storage Class Summary ==="
-$storageClassSummary | Format-Table -Property StorageClass, ObjectCount, @{Name="TotalSize";Expression={$_.TotalSize};Align="Right"} -AutoSize
-
-# Save detailed report to CSV
-$timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$csvPath = "s3-bucket-report-$timestamp.csv"
-
-# Prepare CSV data with all storage classes as columns
-# First, get all possible storage classes across all buckets
-$allStorageClassNames = $report.StorageClasses | ForEach-Object { $_.StorageClass } | Sort-Object -Unique
-
-# Create CSV data with consistent columns
-$csvData = foreach ($item in $report) {
-    # Format creation date
-    $creationDate = if ($item.CreationDate) { 
-        (Get-Date $item.CreationDate).ToString('yyyy-MM-dd HH:mm:ss "UTC"zzz') 
-    } else { 
-        'N/A' 
-    }
-    
-    # Create base properties
-    $csvItem = [PSCustomObject]@{
-        'Bucket Name'    = $item.BucketName
-        'Region'         = $item.Region
-        'Total Objects'  = $item.ObjectCount
-        'Total Size'     = $item.TotalSize
-        'Creation Date'  = $creationDate
-    }
-    
-    # Initialize all storage class columns with zeros
-    foreach ($sc in $allStorageClassNames) {
-        $csvItem | Add-Member -MemberType NoteProperty -Name "$sc Objects" -Value 0
-        $csvItem | Add-Member -MemberType NoteProperty -Name "$sc Size" -Value '0 B'
-    }
-    
-    # Fill in actual values for this bucket's storage classes
-    foreach ($sc in $item.StorageClasses) {
-        $scName = $sc.StorageClass
-        $csvItem."$scName Objects" = $sc.ObjectCount
-        $csvItem."$scName Size" = $sc.FormattedSize
-    }
-    
-    $csvItem
-}
-
-# Reorder columns for better readability
-$columnOrder = @('Bucket Name', 'Region', 'Creation Date', 'Total Objects', 'Total Size')
-$storageClassColumns = $allStorageClassNames | ForEach-Object { 
-    $sc = $_
-    @("$sc Objects", "$sc Size")
-} | Select-Object -Unique
-
-$columnOrder += $storageClassColumns
-
-# Export to CSV with ordered columns
-$csvData | Select-Object $columnOrder | 
-    Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
-
-Write-Host "`nReport saved to: $csvPath"

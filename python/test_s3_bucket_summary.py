@@ -1,4 +1,5 @@
 import csv
+import datetime as dt
 import io
 import tempfile
 import unittest
@@ -34,6 +35,67 @@ class FakeS3Client:
     def get_paginator(self, operation):
         self.operation = operation
         return self.paginator
+
+
+class FakeCloudWatchPaginator:
+    def paginate(self, **request):
+        return [
+            {
+                "Metrics": [
+                    {
+                        "Dimensions": [
+                            {"Name": "BucketName", "Value": "example-bucket"},
+                            {"Name": "StorageType", "Value": "StandardStorage"},
+                        ]
+                    },
+                    {
+                        "Dimensions": [
+                            {"Name": "BucketName", "Value": "example-bucket"},
+                            {"Name": "StorageType", "Value": "GlacierStorage"},
+                        ]
+                    },
+                ]
+            }
+        ]
+
+
+class FakeCloudWatchClient:
+    def get_paginator(self, operation):
+        self.operation = operation
+        return FakeCloudWatchPaginator()
+
+    def get_metric_data(self, **request):
+        timestamp = dt.datetime(2026, 6, 18, tzinfo=dt.timezone.utc)
+        results = []
+        for query in request["MetricDataQueries"]:
+            metric = query["MetricStat"]["Metric"]
+            dimensions = {
+                item["Name"]: item["Value"] for item in metric["Dimensions"]
+            }
+            if metric["MetricName"] == "NumberOfObjects":
+                value = 42
+            elif dimensions["StorageType"] == "StandardStorage":
+                value = 1_000
+            else:
+                value = 9_000
+            results.append(
+                {
+                    "Id": query["Id"],
+                    "Values": [value],
+                    "Timestamps": [timestamp],
+                }
+            )
+        return {"MetricDataResults": results}
+
+
+class FakeSession:
+    def __init__(self):
+        self.cloudwatch = FakeCloudWatchClient()
+
+    def client(self, service_name, **kwargs):
+        if service_name != "cloudwatch":
+            raise AssertionError(service_name)
+        return self.cloudwatch
 
 
 class S3BucketSummaryTests(unittest.TestCase):
@@ -116,6 +178,37 @@ class S3BucketSummaryTests(unittest.TestCase):
 
         self.assertEqual(report.TierUsage(5, 300), totals["STANDARD"])
         self.assertEqual(report.TierUsage(1, 500), totals["GLACIER"])
+
+    def test_fast_cloudwatch_summary_uses_daily_aggregate_metrics(self):
+        with patch.object(
+            report,
+            "get_bucket_regions",
+            return_value=({"example-bucket": "us-east-1"}, {}),
+        ):
+            results = report.get_cloudwatch_summary(
+                FakeSession(),
+                [{"Name": "example-bucket"}],
+                workers=4,
+            )
+
+        self.assertEqual(1, len(results))
+        result = results[0]
+        self.assertEqual(42, result.object_count)
+        self.assertEqual(10_000, result.size_bytes)
+        self.assertEqual(1_000, result.tiers["STANDARD"].size_bytes)
+        self.assertEqual(9_000, result.tiers["GLACIER"].size_bytes)
+        self.assertFalse(result.tier_counts_available)
+        self.assertEqual("2026-06-18T00:00:00+00:00", result.metric_timestamp)
+
+    def test_storage_type_mapping_groups_cloudwatch_overhead(self):
+        self.assertEqual(
+            "DEEP_ARCHIVE",
+            report.storage_type_to_tier("DeepArchiveObjectOverhead"),
+        )
+        self.assertEqual(
+            "INTELLIGENT_TIERING_AA",
+            report.storage_type_to_tier("IntAAObjectOverhead"),
+        )
 
     def test_csv_has_one_valid_header_row(self):
         results = [

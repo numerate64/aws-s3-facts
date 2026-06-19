@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fast, exact S3 object count and storage-class capacity report."""
+"""Fast CloudWatch and exact object-level S3 storage reports."""
 
 from __future__ import annotations
 
@@ -41,6 +41,8 @@ class BucketUsage:
     tiers: dict[str, TierUsage] = field(default_factory=dict)
     error: str = ""
     elapsed_seconds: float = 0.0
+    tier_counts_available: bool = True
+    metric_timestamp: str = ""
 
 
 _thread_local = threading.local()
@@ -154,6 +156,32 @@ def normalize_region(location: str | None) -> str:
     return location
 
 
+def storage_type_to_tier(storage_type: str) -> str:
+    """Group CloudWatch billing storage types into readable S3 tiers."""
+    mappings = (
+        ("DeepArchive", "DEEP_ARCHIVE"),
+        ("GlacierInstantRetrieval", "GLACIER_IR"),
+        ("GlacierIR", "GLACIER_IR"),
+        ("Glacier", "GLACIER"),
+        ("StandardIA", "STANDARD_IA"),
+        ("OneZoneIA", "ONEZONE_IA"),
+        ("ReducedRedundancy", "REDUCED_REDUNDANCY"),
+        ("ExpressOneZone", "EXPRESS_ONEZONE"),
+        ("IntelligentTieringFA", "INTELLIGENT_TIERING_FA"),
+        ("IntelligentTieringIA", "INTELLIGENT_TIERING_IA"),
+        ("IntelligentTieringAIA", "INTELLIGENT_TIERING_AIA"),
+        ("IntelligentTieringAA", "INTELLIGENT_TIERING_AA"),
+        ("IntelligentTieringDAA", "INTELLIGENT_TIERING_DAA"),
+        ("IntAA", "INTELLIGENT_TIERING_AA"),
+        ("IntDAA", "INTELLIGENT_TIERING_DAA"),
+        ("StandardStorage", "STANDARD"),
+    )
+    for prefix, tier in mappings:
+        if storage_type.startswith(prefix):
+            return tier
+    return storage_type.upper()
+
+
 def create_session(profile_name: str | None) -> boto3.Session:
     return boto3.Session(profile_name=profile_name) if profile_name else boto3.Session()
 
@@ -192,6 +220,187 @@ def get_bucket_region(session: boto3.Session, bucket_name: str, workers: int) ->
     s3 = get_s3_client(session, session.region_name or "us-east-1", workers)
     response = s3.get_bucket_location(Bucket=bucket_name)
     return normalize_region(response.get("LocationConstraint"))
+
+
+def get_bucket_regions(
+    session: boto3.Session,
+    buckets: Iterable[dict],
+    workers: int,
+) -> tuple[dict[str, str], dict[str, str]]:
+    regions: dict[str, str] = {}
+    errors: dict[str, str] = {}
+    bucket_names = [bucket["Name"] for bucket in buckets]
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="s3-region") as executor:
+        futures = {
+            executor.submit(get_bucket_region, session, bucket_name, workers): bucket_name
+            for bucket_name in bucket_names
+        }
+        for future in as_completed(futures):
+            bucket_name = futures[future]
+            try:
+                regions[bucket_name] = future.result()
+            except (ClientError, BotoCoreError) as exc:
+                errors[bucket_name] = str(exc)
+
+    return regions, errors
+
+
+def chunks(items: list[dict], size: int) -> Iterable[list[dict]]:
+    for index in range(0, len(items), size):
+        yield items[index : index + size]
+
+
+def latest_metric_value(result: dict) -> tuple[float | None, dt.datetime | None]:
+    values = result.get("Values", [])
+    timestamps = result.get("Timestamps", [])
+    if not values or not timestamps:
+        return None, None
+    timestamp, value = max(zip(timestamps, values), key=lambda item: item[0])
+    return float(value), timestamp
+
+
+def get_cloudwatch_summary(
+    session: boto3.Session,
+    buckets: Iterable[dict],
+    workers: int,
+) -> list[BucketUsage]:
+    """Read daily S3 storage metrics without listing object keys."""
+    bucket_list = list(buckets)
+    bucket_names = {bucket["Name"] for bucket in bucket_list}
+    regions, region_errors = get_bucket_regions(session, bucket_list, workers)
+    results = {
+        bucket["Name"]: BucketUsage(
+            bucket_name=bucket["Name"],
+            region=regions.get(bucket["Name"], ""),
+            error=region_errors.get(bucket["Name"], ""),
+            tier_counts_available=False,
+        )
+        for bucket in bucket_list
+    }
+
+    buckets_by_region: defaultdict[str, set[str]] = defaultdict(set)
+    for bucket_name, region in regions.items():
+        buckets_by_region[region].add(bucket_name)
+
+    end_time = dt.datetime.now(dt.timezone.utc)
+    start_time = end_time - dt.timedelta(days=3)
+
+    for region, regional_buckets in sorted(buckets_by_region.items()):
+        cloudwatch = session.client(
+            "cloudwatch",
+            region_name=region,
+            config=Config(
+                retries={"max_attempts": 10, "mode": "adaptive"},
+                max_pool_connections=max(10, workers * 2),
+            ),
+        )
+
+        size_metrics: list[tuple[str, str]] = []
+        paginator = cloudwatch.get_paginator("list_metrics")
+        for page in paginator.paginate(Namespace="AWS/S3", MetricName="BucketSizeBytes"):
+            for metric in page.get("Metrics", []):
+                dimensions = {
+                    dimension["Name"]: dimension["Value"]
+                    for dimension in metric.get("Dimensions", [])
+                }
+                bucket_name = dimensions.get("BucketName")
+                storage_type = dimensions.get("StorageType")
+                if bucket_name in regional_buckets and storage_type:
+                    size_metrics.append((bucket_name, storage_type))
+
+        query_map: dict[str, tuple[str, str, str]] = {}
+        queries: list[dict] = []
+
+        for bucket_name in sorted(regional_buckets):
+            query_id = f"m{len(queries)}"
+            query_map[query_id] = (bucket_name, "count", "AllStorageTypes")
+            queries.append(
+                {
+                    "Id": query_id,
+                    "MetricStat": {
+                        "Metric": {
+                            "Namespace": "AWS/S3",
+                            "MetricName": "NumberOfObjects",
+                            "Dimensions": [
+                                {"Name": "BucketName", "Value": bucket_name},
+                                {"Name": "StorageType", "Value": "AllStorageTypes"},
+                            ],
+                        },
+                        "Period": 86400,
+                        "Stat": "Average",
+                    },
+                    "ReturnData": True,
+                }
+            )
+
+        for bucket_name, storage_type in sorted(set(size_metrics)):
+            query_id = f"m{len(queries)}"
+            query_map[query_id] = (bucket_name, "size", storage_type)
+            queries.append(
+                {
+                    "Id": query_id,
+                    "MetricStat": {
+                        "Metric": {
+                            "Namespace": "AWS/S3",
+                            "MetricName": "BucketSizeBytes",
+                            "Dimensions": [
+                                {"Name": "BucketName", "Value": bucket_name},
+                                {"Name": "StorageType", "Value": storage_type},
+                            ],
+                        },
+                        "Period": 86400,
+                        "Stat": "Average",
+                    },
+                    "ReturnData": True,
+                }
+            )
+
+        for query_batch in chunks(queries, 500):
+            response = cloudwatch.get_metric_data(
+                MetricDataQueries=query_batch,
+                StartTime=start_time,
+                EndTime=end_time,
+                ScanBy="TimestampDescending",
+            )
+            metric_results = response.get("MetricDataResults", [])
+            while response.get("NextToken"):
+                response = cloudwatch.get_metric_data(
+                    MetricDataQueries=query_batch,
+                    StartTime=start_time,
+                    EndTime=end_time,
+                    ScanBy="TimestampDescending",
+                    NextToken=response["NextToken"],
+                )
+                metric_results.extend(response.get("MetricDataResults", []))
+
+            for metric_result in metric_results:
+                query_id = metric_result["Id"]
+                bucket_name, metric_kind, storage_type = query_map[query_id]
+                value, timestamp = latest_metric_value(metric_result)
+                if value is None:
+                    continue
+
+                bucket_result = results[bucket_name]
+                if timestamp:
+                    timestamp_text = timestamp.astimezone(dt.timezone.utc).isoformat()
+                    if not bucket_result.metric_timestamp or timestamp_text > bucket_result.metric_timestamp:
+                        bucket_result.metric_timestamp = timestamp_text
+
+                if metric_kind == "count":
+                    bucket_result.object_count = int(round(value))
+                else:
+                    tier = storage_type_to_tier(storage_type)
+                    usage = bucket_result.tiers.setdefault(tier, TierUsage())
+                    usage.size_bytes += int(round(value))
+                    bucket_result.size_bytes += int(round(value))
+
+    for bucket_name in bucket_names:
+        result = results[bucket_name]
+        if not result.error and not result.metric_timestamp:
+            result.error = "No CloudWatch daily storage metrics found in the last 3 days"
+
+    return sorted(results.values(), key=lambda item: item.bucket_name.lower())
 
 
 def scan_bucket(
@@ -300,6 +509,8 @@ def write_csv(results: list[BucketUsage], account_id: str, output_path: Path) ->
         "Total Size (Bytes)",
         "Total Size",
         "Elapsed Seconds",
+        "Metric Timestamp",
+        "Tier Counts Available",
         "Error",
     ]
     for tier in tier_names:
@@ -319,11 +530,15 @@ def write_csv(results: list[BucketUsage], account_id: str, output_path: Path) ->
                 "Total Size (Bytes)": bucket.size_bytes,
                 "Total Size": format_size(bucket.size_bytes),
                 "Elapsed Seconds": f"{bucket.elapsed_seconds:.3f}",
+                "Metric Timestamp": bucket.metric_timestamp,
+                "Tier Counts Available": bucket.tier_counts_available,
                 "Error": bucket.error,
             }
             for tier in tier_names:
                 usage = bucket.tiers.get(tier, TierUsage())
-                row[f"{tier} Objects"] = usage.object_count
+                row[f"{tier} Objects"] = (
+                    usage.object_count if bucket.tier_counts_available else ""
+                )
                 row[f"{tier} Size (Bytes)"] = usage.size_bytes
                 row[f"{tier} Size"] = format_size(usage.size_bytes)
             writer.writerow(row)
@@ -338,10 +553,22 @@ def write_csv(results: list[BucketUsage], account_id: str, output_path: Path) ->
             "Object Count": sum(bucket.object_count for bucket in successful),
             "Total Size (Bytes)": total_size,
             "Total Size": format_size(total_size),
+            "Metric Timestamp": max(
+                (bucket.metric_timestamp for bucket in successful),
+                default="",
+            ),
+            "Tier Counts Available": all(
+                bucket.tier_counts_available for bucket in successful
+            ),
         }
+        tier_counts_available = all(
+            bucket.tier_counts_available for bucket in successful
+        )
         for tier in tier_names:
             usage = tier_totals.get(tier, TierUsage())
-            total_row[f"{tier} Objects"] = usage.object_count
+            total_row[f"{tier} Objects"] = (
+                usage.object_count if tier_counts_available else ""
+            )
             total_row[f"{tier} Size (Bytes)"] = usage.size_bytes
             total_row[f"{tier} Size"] = format_size(usage.size_bytes)
         writer.writerow(total_row)
@@ -359,11 +586,25 @@ def print_summary(results: list[BucketUsage], account_id: str) -> None:
     print(f"Total objects:   {total_objects:,}")
     print(f"Total capacity:  {format_size(total_size)} ({total_size:,} bytes)")
     print("\nStorage class / tier:")
+    tier_counts_available = all(
+        bucket.tier_counts_available for bucket in successful
+    )
     for name, usage in tiers.items():
-        print(
-            f"  {name:<24} {usage.object_count:>15,} objects  "
-            f"{format_size(usage.size_bytes):>14}  ({usage.size_bytes:,} bytes)"
-        )
+        if tier_counts_available:
+            print(
+                f"  {name:<24} {usage.object_count:>15,} objects  "
+                f"{format_size(usage.size_bytes):>14}  ({usage.size_bytes:,} bytes)"
+            )
+        else:
+            print(
+                f"  {name:<24} {'N/A':>15} objects  "
+                f"{format_size(usage.size_bytes):>14}  ({usage.size_bytes:,} bytes)"
+            )
+
+    metric_timestamps = [bucket.metric_timestamp for bucket in successful if bucket.metric_timestamp]
+    if metric_timestamps:
+        print(f"\nCloudWatch metrics as of: {max(metric_timestamps)}")
+        print("Tier object counts are unavailable in standard CloudWatch S3 metrics.")
 
     errors = [bucket for bucket in results if bucket.error]
     if errors:
@@ -372,9 +613,15 @@ def print_summary(results: list[BucketUsage], account_id: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Count S3 objects and sum exact capacity by S3 storage class."
+        description="Report S3 object count and capacity by storage tier."
     )
     parser.add_argument("--profile", help="AWS named profile (default: normal credential chain)")
+    parser.add_argument(
+        "--mode",
+        choices=("fast", "exact"),
+        default="fast",
+        help="fast uses daily CloudWatch metrics; exact lists every current object",
+    )
     parser.add_argument(
         "--workers",
         type=int,
@@ -390,7 +637,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--requester-pays",
         action="store_true",
-        help="Set RequestPayer=requester when listing buckets",
+        help="Set RequestPayer=requester in exact mode",
     )
     return parser.parse_args()
 
@@ -405,13 +652,19 @@ def main() -> int:
     try:
         session = create_session(args.profile)
         buckets, account_id = discover_buckets(session, args.workers)
-        print(f"Found {len(buckets):,} buckets; scanning with {args.workers} workers...")
-        results = scan_all_buckets(
-            session,
-            buckets,
-            args.workers,
-            requester_pays=args.requester_pays,
-        )
+        if args.mode == "fast":
+            print(
+                f"Found {len(buckets):,} buckets; reading daily CloudWatch storage metrics..."
+            )
+            results = get_cloudwatch_summary(session, buckets, args.workers)
+        else:
+            print(f"Found {len(buckets):,} buckets; scanning with {args.workers} workers...")
+            results = scan_all_buckets(
+                session,
+                buckets,
+                args.workers,
+                requester_pays=args.requester_pays,
+            )
         write_csv(results, account_id, args.output)
         print_summary(results, account_id)
         print(f"\nCSV written to {args.output}")

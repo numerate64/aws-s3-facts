@@ -13,7 +13,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable, TextIO
 
 import boto3
 from botocore.config import Config
@@ -45,6 +45,96 @@ class BucketUsage:
 
 _thread_local = threading.local()
 _client_create_lock = threading.Lock()
+
+
+class ProgressReporter:
+    """Thread-safe terminal progress for concurrent bucket scans."""
+
+    def __init__(
+        self,
+        total: int,
+        stream: TextIO = sys.stdout,
+        width: int = 28,
+        refresh_seconds: float = 0.5,
+        interactive: bool | None = None,
+    ) -> None:
+        self.total = total
+        self.stream = stream
+        self.width = width
+        self.refresh_seconds = refresh_seconds
+        self.interactive = stream.isatty() if interactive is None else interactive
+        self.completed = 0
+        self.active: dict[str, tuple[int, int]] = {}
+        self.last_rendered = 0.0
+        self.lock = threading.Lock()
+
+    def start(self) -> None:
+        with self.lock:
+            self._render_locked(force=True)
+
+    def update(self, bucket_name: str, object_count: int, size_bytes: int) -> None:
+        with self.lock:
+            self.active[bucket_name] = (object_count, size_bytes)
+            self._render_locked()
+
+    def complete(self, result: BucketUsage) -> None:
+        with self.lock:
+            self.completed += 1
+            self.active.pop(result.bucket_name, None)
+            message = self._completion_message(result)
+            if self.interactive:
+                self.stream.write("\r\033[2K")
+            self.stream.write(message + "\n")
+            self._render_locked(force=True)
+
+    def finish(self) -> None:
+        with self.lock:
+            if self.interactive:
+                self._render_locked(force=True)
+                self.stream.write("\n")
+                self.stream.flush()
+
+    def _completion_message(self, result: BucketUsage) -> str:
+        prefix = f"[{self.completed}/{self.total}] {result.bucket_name}:"
+        if result.error:
+            return f"{prefix} ERROR {result.error}"
+        return (
+            f"{prefix} {result.object_count:,} objects, "
+            f"{format_size(result.size_bytes)} in {result.elapsed_seconds:.1f}s"
+        )
+
+    def _render_locked(self, force: bool = False) -> None:
+        if not self.interactive:
+            return
+
+        now = time.monotonic()
+        if not force and now - self.last_rendered < self.refresh_seconds:
+            return
+        self.last_rendered = now
+
+        ratio = self.completed / self.total if self.total else 1.0
+        filled = min(self.width, int(self.width * ratio))
+        bar = "█" * filled + "░" * (self.width - filled)
+        line = (
+            f"\r\033[2KBuckets [{bar}] {self.completed}/{self.total} "
+            f"({ratio * 100:5.1f}%)"
+        )
+
+        if self.active:
+            bucket_name, (object_count, size_bytes) = max(
+                self.active.items(),
+                key=lambda item: item[1][0],
+            )
+            if len(bucket_name) > 32:
+                bucket_name = f"{bucket_name[:29]}..."
+            spinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(now * 10) % 10]
+            line += (
+                f" | {spinner} {bucket_name}: "
+                f"{object_count:,} objects, {format_size(size_bytes)}"
+            )
+
+        self.stream.write(line)
+        self.stream.flush()
 
 
 def format_size(size_bytes: int) -> str:
@@ -109,12 +199,15 @@ def scan_bucket(
     bucket_name: str,
     workers: int,
     requester_pays: bool = False,
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> BucketUsage:
     """List one bucket once and sum exact object bytes for every storage class."""
     started = time.monotonic()
     result = BucketUsage(bucket_name=bucket_name)
 
     try:
+        if progress_callback:
+            progress_callback(bucket_name, 0, 0)
         result.region = get_bucket_region(session, bucket_name, workers)
         s3 = get_s3_client(session, result.region, workers)
         request = {"Bucket": bucket_name, "PaginationConfig": {"PageSize": 1000}}
@@ -133,6 +226,8 @@ def scan_bucket(
                 result.size_bytes += size
                 tier_counts[storage_class] += 1
                 tier_sizes[storage_class] += size
+            if progress_callback:
+                progress_callback(bucket_name, result.object_count, result.size_bytes)
 
         result.tiers = {
             name: TierUsage(tier_counts[name], tier_sizes[name])
@@ -155,33 +250,29 @@ def scan_all_buckets(
     bucket_list = list(buckets)
     results: list[BucketUsage] = []
     total = len(bucket_list)
+    progress = ProgressReporter(total)
+    progress.start()
 
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="s3-scan") as executor:
-        futures = {
-            executor.submit(
-                scan_bucket,
-                session,
-                bucket["Name"],
-                workers,
-                requester_pays,
-            ): bucket["Name"]
-            for bucket in bucket_list
-        }
+    try:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="s3-scan") as executor:
+            futures = {
+                executor.submit(
+                    scan_bucket,
+                    session,
+                    bucket["Name"],
+                    workers,
+                    requester_pays,
+                    progress.update,
+                ): bucket["Name"]
+                for bucket in bucket_list
+            }
 
-        for completed, future in enumerate(as_completed(futures), 1):
-            result = future.result()
-            results.append(result)
-            if result.error:
-                print(
-                    f"[{completed}/{total}] {result.bucket_name}: ERROR {result.error}",
-                    file=sys.stderr,
-                )
-            else:
-                print(
-                    f"[{completed}/{total}] {result.bucket_name}: "
-                    f"{result.object_count:,} objects, {format_size(result.size_bytes)} "
-                    f"in {result.elapsed_seconds:.1f}s"
-                )
+            for future in as_completed(futures):
+                result = future.result()
+                results.append(result)
+                progress.complete(result)
+    finally:
+        progress.finish()
 
     return sorted(results, key=lambda item: item.bucket_name.lower())
 

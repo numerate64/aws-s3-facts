@@ -10,6 +10,7 @@ storage class, scan multiple buckets concurrently, and export a flat CSV.
 - Bounded bucket-level concurrency (`8` workers by default).
 - Maximum S3 page size (`1,000` objects per request).
 - Streaming aggregation with no retained object list.
+- Live bucket progress bar with object and byte counts for long-running scans.
 - One bucket-location lookup and one paginated listing per bucket.
 - Adaptive retries in Python and AWS CLI automatic pagination in PowerShell.
 - Partial failures are reported without discarding successful bucket results.

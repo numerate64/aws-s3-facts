@@ -1,4 +1,5 @@
 import csv
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -38,12 +39,20 @@ class FakeS3Client:
 class S3BucketSummaryTests(unittest.TestCase):
     def test_scan_bucket_sums_exact_bytes_per_storage_class(self):
         client = FakeS3Client()
+        progress_updates = []
 
         with (
             patch.object(report, "get_bucket_region", return_value="us-east-1"),
             patch.object(report, "get_s3_client", return_value=client),
         ):
-            result = report.scan_bucket(object(), "example-bucket", workers=4)
+            result = report.scan_bucket(
+                object(),
+                "example-bucket",
+                workers=4,
+                progress_callback=lambda name, count, size: progress_updates.append(
+                    (name, count, size)
+                ),
+            )
 
         self.assertEqual("list_objects_v2", client.operation)
         self.assertEqual(4, result.object_count)
@@ -52,6 +61,41 @@ class S3BucketSummaryTests(unittest.TestCase):
         self.assertEqual(150, result.tiers["STANDARD"].size_bytes)
         self.assertEqual(900, result.tiers["GLACIER"].size_bytes)
         self.assertEqual(2_000, result.tiers["DEEP_ARCHIVE"].size_bytes)
+        self.assertEqual(
+            [
+                ("example-bucket", 0, 0),
+                ("example-bucket", 2, 1_000),
+                ("example-bucket", 4, 3_050),
+            ],
+            progress_updates,
+        )
+
+    def test_progress_reporter_shows_bar_and_active_bucket(self):
+        stream = io.StringIO()
+        progress = report.ProgressReporter(
+            total=2,
+            stream=stream,
+            interactive=True,
+            refresh_seconds=0,
+        )
+
+        progress.start()
+        progress.update("large-example-bucket", 12_345, 9_876_543)
+        progress.complete(
+            report.BucketUsage(
+                "small-bucket",
+                object_count=3,
+                size_bytes=100,
+                elapsed_seconds=0.5,
+            )
+        )
+        progress.finish()
+
+        output = stream.getvalue()
+        self.assertIn("Buckets [", output)
+        self.assertIn("1/2", output)
+        self.assertIn("large-example-bucket", output)
+        self.assertIn("12,345 objects", output)
 
     def test_aggregate_tiers_combines_bucket_totals(self):
         results = [

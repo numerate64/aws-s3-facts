@@ -1,7 +1,8 @@
 # Python S3 Bucket Summary
 
 `s3_bucket_summary.py` scans buckets concurrently and calculates exact object
-counts and object bytes for every observed S3 storage class.
+counts and object bytes for every observed S3 storage class. A live progress
+bar shows completed buckets plus object and byte counts for active scans.
 
 ## Requirements
 
